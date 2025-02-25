@@ -26,11 +26,17 @@ try:
     scaler_anomaly = joblib.load("autoencoder_scaler.pkl")
     scaler_ml = joblib.load("ml_scaler.pkl")
     scaler_ddos = joblib.load("ddos_scaler.pkl")  # Load DDoS scaler
-    le_method_anomaly = joblib.load("method_encoder.pkl")
-    le_path_anomaly = joblib.load("path_encoder.pkl")
-    le_method_ml = joblib.load("method_encoder.pkl")
-    le_path_ml = joblib.load("path_encoder.pkl")
-    le_body_ml = joblib.load("body_encoder.pkl")
+    
+    # Load anomaly encoders
+    le_method_anomaly = joblib.load("AL_method_encoder.pkl")
+    le_path_anomaly = joblib.load("AL_path_encoder.pkl")
+    le_body_anomaly = joblib.load("AL_body_encoder.pkl")  # Added missing anomaly body encoder
+    
+    # Load ML encoders   
+    le_method_ml = joblib.load("ML_method_encoder.pkl")
+    le_path_ml = joblib.load("ML_path_encoder.pkl")
+    le_body_ml = joblib.load("ML_body_encoder.pkl")
+
     le_highest = joblib.load("highest_layer_encoder.pkl")  # Load DDoS encoders
     le_transport = joblib.load("transport_layer_encoder.pkl")
     le_ip = joblib.load("ip_encoder.pkl")  # New encoder for IP addresses
