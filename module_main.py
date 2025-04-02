@@ -9,12 +9,13 @@ import threading
 from flask import Flask, request, jsonify
 from tensorflow.keras.models import load_model
 from datetime import datetime
+from sklearn.preprocessing import LabelEncoder
 
-# Configure logging for dashboard integration (JSON-like format)
+# Configure logging for detailed debugging
 logging.basicConfig(
     filename="awaf_proxy.log",
-    level=logging.INFO,
-    format='{"timestamp": "%(asctime)s", "level": "%(levelname)s", "message": %(message)s}',
+    level=logging.DEBUG,
+    format='{"timestamp": "%(asctime)s", "level": "%(levelname)s", "message": %(message)s, "module": "%(module)s", "line": %(lineno)d}',
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 
@@ -23,12 +24,14 @@ DASHBOARD_LOG_FILE = "awaf_dashboard.json"
 
 # Load models and encoders safely
 try:
-    autoencoder = load_model("my_model.keras")  # Anomaly Detection (numerical features)
-    ml_model = load_model("lstm_model_common_attack.keras")  # SQLi/XSS Detection
-    ddos_model = load_model("ddos_lstm_model.keras")  # DDoS Detection
+    autoencoder = load_model("my_model.keras")
+    ml_model = load_model("lstm_model_common_attack.keras")
+    ddos_model = load_model("ddos_lstm_model.keras")
     scaler_anomaly = joblib.load("autoencoder_scaler.pkl")
     scaler_ml = joblib.load("ml_scaler.pkl")
     scaler_ddos = joblib.load("ddos_scaler.pkl")
+    
+    # Load encoders and ensure they are usable
     le_method_anomaly = joblib.load("AL_method_encoder.pkl")
     le_path_anomaly = joblib.load("AL_path_encoder.pkl")
     le_body_anomaly = joblib.load("AL_body_encoder.pkl")
@@ -45,9 +48,9 @@ try:
     print(f"[DEBUG] Anomaly Threshold: {anomaly_threshold}")
     print(f"[DEBUG] DDoS Threshold: {ddos_threshold}")
     print("Expected Input Shapes:")
-    print("Anomaly Model:", autoencoder.input_shape)  # (None, 13)
-    print("ML Model:", ml_model.input_shape)         # (None, 10, 19)
-    print("DDoS Model:", ddos_model.input_shape)     # (None, 10, 8)
+    print("Anomaly Model:", autoencoder.input_shape)
+    print("ML Model:", ml_model.input_shape)
+    print("DDoS Model:", ddos_model.input_shape)
     logging.info('{"event": "models_loaded", "status": "success", "anomaly_threshold": %f, "ddos_threshold": %f}' % (anomaly_threshold, ddos_threshold))
 except Exception as e:
     error_msg = '{"event": "models_load_failed", "error": "%s"}' % str(e)
@@ -62,8 +65,9 @@ FEATURES_ML_SIZE = ml_model.input_shape[2]         # 19
 FEATURES_DDOS_SIZE = ddos_model.input_shape[2]     # 8
 TIME_STEPS = 10
 
-ANOMALY_THRESHOLD = float(anomaly_threshold)
-ML_THRESHOLD = 0.998
+# Adjusted thresholds to be less strict
+ANOMALY_THRESHOLD = float(anomaly_threshold) * 1.5  # ~0.85
+ML_THRESHOLD = 1
 DDOS_THRESHOLD = ddos_threshold
 
 # Locks for thread safety
@@ -76,17 +80,24 @@ ANOMALY_CSV = "anomaly_data.csv"
 ML_CSV = "ml_data.csv"
 DDOS_CSV = "ddos_data.csv"
 
-def handle_unseen_labels(encoder, value, default="unknown"):
-    """Handle unseen labels in LabelEncoder by returning a default value (0)."""
+def handle_unseen_labels(encoder, value, encoder_file):
+    """Handle unseen labels by adding them dynamically and retraining the encoder."""
     try:
         return encoder.transform([value])[0]
     except ValueError:
-        print(f"[DEBUG] ⚠️ Unseen label '{value}' in encoder, using default 0.")
-        logging.warning('{"event": "unseen_label", "encoder": "%s", "value": "%s", "default": 0}' % (encoder.__class__.__name__, value))
-        return 0
+        print(f"[DEBUG] ⚠️ Unseen label '{value}' in encoder, adding dynamically.")
+        logging.warning('{"event": "unseen_label", "encoder": "%s", "value": "%s"}' % (encoder.__class__.__name__, value))
+        # Add the new label to the encoder
+        current_classes = list(encoder.classes_) if hasattr(encoder, 'classes_') else []
+        if value not in current_classes:
+            current_classes.append(value)
+            encoder.classes_ = np.array(current_classes)
+            # Retrain and save the updated encoder
+            joblib.dump(encoder, encoder_file)
+            logging.info('{"event": "encoder_updated", "file": "%s", "new_class": "%s"}' % (encoder_file, value))
+        return len(encoder.classes_) - 1  # Return index of newly added label
 
 def ip_to_numeric(ip_str):
-    """Convert IP address string to a numerical value using LabelEncoder."""
     try:
         if isinstance(ip_str, str):
             return le_ip.transform([ip_str])[0].item()
@@ -97,7 +108,6 @@ def ip_to_numeric(ip_str):
         return 0
 
 def save_to_csv(data, filepath, headers, label=None):
-    """Append data to CSV file with optional label."""
     if label is not None:
         data.append(label)
         headers.append("label")
@@ -108,15 +118,14 @@ def save_to_csv(data, filepath, headers, label=None):
         df.to_csv(filepath, mode='a', header=False, index=False)
 
 def preprocess_request(data, feature_size, time_steps, model_type):
-    """Preprocess request data and return both processed array and raw features."""
     try:
         body_text = data.get("body", "").strip()
         print(f"[DEBUG] 📌 Processing {model_type} - Body Text: '{body_text}'")
 
         if model_type == "anomaly":
             features = [
-                handle_unseen_labels(le_method_anomaly, data.get("method", "GET")),
-                handle_unseen_labels(le_path_anomaly, data.get("path", "/")),
+                handle_unseen_labels(le_method_anomaly, data.get("method", "GET"), "AL_method_encoder.pkl"),
+                handle_unseen_labels(le_path_anomaly, data.get("path", "/"), "AL_path_encoder.pkl"),
                 data.get("url_length", 0), data.get("body_length", 0),
                 data.get("path_entropy", 0), data.get("body_entropy", 0),
                 data.get("header_count", 0), data.get("sql_injection_count", 0),
@@ -132,8 +141,8 @@ def preprocess_request(data, feature_size, time_steps, model_type):
                        "directory_traversal_count", "csrf_count", "base64_count"]
         elif model_type == "ml":
             features = [
-                handle_unseen_labels(le_method_ml, data.get("method", "GET")),
-                handle_unseen_labels(le_path_ml, data.get("path", "/")),
+                handle_unseen_labels(le_method_ml, data.get("method", "GET"), "ML_method_encoder.pkl"),
+                handle_unseen_labels(le_path_ml, data.get("path", "/"), "ML_path_encoder.pkl"),
                 data.get("url_length", 0), data.get("body_length", 0),
                 data.get("single_q", 0), data.get("double_q", 0), data.get("dashes", 0),
                 data.get("braces", 0), data.get("spaces", 0), data.get("path_entropy", 0),
@@ -141,7 +150,7 @@ def preprocess_request(data, feature_size, time_steps, model_type):
                 data.get("header_count", 0), data.get("sql_injection_count", 0),
                 data.get("xss_attack_count", 0), data.get("command_injection_count", 0),
                 data.get("directory_traversal_count", 0), data.get("csrf_count", 0),
-                handle_unseen_labels(le_body_ml, body_text)
+                handle_unseen_labels(le_body_ml, body_text, "ML_body_encoder.pkl")
             ]
             final_array = scaler_ml.transform([features]).astype(np.float32)
             final_array = np.tile(final_array, (time_steps, 1)).reshape(1, time_steps, feature_size)
@@ -151,8 +160,8 @@ def preprocess_request(data, feature_size, time_steps, model_type):
                        "command_injection_count", "directory_traversal_count", "csrf_count", "body"]
         elif model_type == "ddos":
             features = [
-                handle_unseen_labels(le_highest, data.get("highest_layer", "ARP")),
-                handle_unseen_labels(le_transport, data.get("transport_layer", "UDP")),
+                handle_unseen_labels(le_highest, data.get("highest_layer", "ARP"), "highest_layer_encoder.pkl"),
+                handle_unseen_labels(le_transport, data.get("transport_layer", "UDP"), "transport_layer_encoder.pkl"),
                 ip_to_numeric(data.get("source_ip", "192.168.1.10")),
                 ip_to_numeric(data.get("dest_ip", "192.168.1.1")),
                 data.get("source_port", 0), data.get("dest_port", 0),
@@ -166,7 +175,7 @@ def preprocess_request(data, feature_size, time_steps, model_type):
             raise ValueError(f"Unknown model type: {model_type}")
 
         print(f"[DEBUG] Final {model_type} Data Shape: {final_array.shape}")
-        logging.info('{"event": "preprocess_request", "model_type": "%s", "features": %s, "shape": %s}' % (model_type, str(features), str(final_array.shape)))
+        logging.debug('{"event": "preprocess_request", "model_type": "%s", "features": %s, "shape": %s}' % (model_type, str(features), str(final_array.shape)))
         return final_array, features, headers
     except Exception as e:
         error_msg = '{"event": "preprocess_error", "model_type": "%s", "error": "%s"}' % (model_type, str(e))
@@ -175,7 +184,6 @@ def preprocess_request(data, feature_size, time_steps, model_type):
         return None, None, None
 
 def retrain_model(model_type):
-    """Retrain the specified model using collected data."""
     try:
         if model_type == "anomaly" and os.path.isfile(ANOMALY_CSV):
             df = pd.read_csv(ANOMALY_CSV)
@@ -208,7 +216,6 @@ def retrain_model(model_type):
         logging.error(f'{{"event": "retrain_error", "model": "{model_type}", "error": "{str(e)}"}}')
 
 def schedule_retraining():
-    """Schedule retraining every 24 hours."""
     while True:
         time.sleep(24 * 60 * 60)  # 24 hours
         retrain_model("anomaly")
@@ -219,7 +226,6 @@ def schedule_retraining():
 threading.Thread(target=schedule_retraining, daemon=True).start()
 
 def detect_attack(request_data):
-    """Detect attacks and collect data for self-learning."""
     try:
         start_time = time.time()
         print("\n[DEBUG] 📥 Processing request:", json.dumps(request_data, indent=2))
@@ -241,9 +247,9 @@ def detect_attack(request_data):
             ddos_pred = ddos_model.predict(ddos_data, verbose=0)
 
         anomaly_score = np.mean(np.abs(anomaly_data - anomaly_pred))
-        ddos_prediction = ddos_pred[0][0] if ddos_pred is not None else 0.0
-        attack_probs = ml_pred[0] if ml_pred is not None else [0.0]
-        ml_max_prob = max(attack_probs)
+        ddos_prediction = float(ddos_pred[0][0]) if ddos_pred is not None else 0.0  # Convert to float
+        attack_probs = ml_pred[0].tolist() if ml_pred is not None else [0.0]  # Convert to list
+        ml_max_prob = float(max(attack_probs))  # Convert to float
 
         is_anomaly = anomaly_score > ANOMALY_THRESHOLD
         is_attack = ml_max_prob > ML_THRESHOLD
@@ -255,33 +261,22 @@ def detect_attack(request_data):
         save_to_csv(ml_features, ML_CSV, ml_headers, label=int(is_attack))
         save_to_csv(ddos_features, DDOS_CSV, ddos_headers, label=int(is_ddos))
 
-        # Rest of the original detection logic remains unchanged
-        anomaly_features = [
-            request_data.get("url_length", 0),
-            request_data.get("body_length", 0),
-            request_data.get("single_q", 0),
-            request_data.get("double_q", 0),
-            request_data.get("dashes", 0),
-            request_data.get("braces", 0),
-            request_data.get("spaces", 0),
-            request_data.get("sql_injection_count", 0),
-            request_data.get("xss_attack_count", 0),
-            request_data.get("command_injection_count", 0),
-            request_data.get("directory_traversal_count", 0),
-            request_data.get("csrf_count", 0)
-        ]
-        feature_contributions = {f"feature_{i}": float(val) for i, val in enumerate(anomaly_features)}
+        # Feature contributions for debugging
+        anomaly_features_dict = {header: float(value) for header, value in zip(anomaly_headers, anomaly_features)}  # Convert to float
+        ml_features_dict = {header: float(value) for header, value in zip(ml_headers, ml_features)}  # Convert to float
 
         print(f"[DEBUG] Anomaly Score Check: {anomaly_score} > {ANOMALY_THRESHOLD} = {is_anomaly}")
         print(f"[DEBUG] ML Prob Check: {ml_max_prob} > {ML_THRESHOLD} = {is_attack}")
         print(f"[DEBUG] DDoS Prob Check: {ddos_prediction} > {DDOS_THRESHOLD} = {is_ddos}")
+        logging.debug('{"event": "prediction_details", "anomaly_score": %f, "ml_max_prob": %f, "ddos_prob": %f, "anomaly_features": %s, "ml_features": %s}' % (
+            anomaly_score, ml_max_prob, ddos_prediction, json.dumps(anomaly_features_dict), json.dumps(ml_features_dict)))
 
         response_time = time.time() - start_time
         timestamp = datetime.now().isoformat()
         source_ip = request_data.get("source_ip", "Unknown")
         dest_ip = request_data.get("dest_ip", "Unknown")
-        source_port = request_data.get("source_port", 0)
-        dest_port = request_data.get("dest_port", 0)
+        source_port = int(request_data.get("source_port", 0))  # Ensure int
+        dest_port = int(request_data.get("dest_port", 0))  # Ensure int
         method = request_data.get("method", "GET")
         path = request_data.get("path", "/")
         query_params = request_data.get("query_params", {})
@@ -290,8 +285,8 @@ def detect_attack(request_data):
 
         total_requests = 1
         rps = 1.0
-        pps = request_data.get("packets_time", 0.0)
-        packet_length = request_data.get("packet_length", 60)
+        pps = float(request_data.get("packets_time", 0.0))  # Convert to float
+        packet_length = int(request_data.get("packet_length", 60))  # Ensure int
         traffic_volume = pps * packet_length
 
         attack_class = "None"
@@ -332,26 +327,26 @@ def detect_attack(request_data):
                 "flagged_ddos_attacks": int(is_ddos)
             },
             "anomaly_detection_metrics": {
-                "path_entropy": request_data.get("path_entropy", 0),
-                "body_entropy": request_data.get("body_entropy", 0),
-                "url_length": request_data.get("url_length", 0),
-                "body_length": request_data.get("body_length", 0),
-                "single_quotes_count": request_data.get("single_q", 0),
-                "double_quotes_count": request_data.get("double_q", 0),
-                "dashes_count": request_data.get("dashes", 0),
-                "braces_count": request_data.get("braces", 0),
-                "spaces_count": request_data.get("spaces", 0),
-                "sql_injection_patterns": request_data.get("sql_injection_count", 0),
-                "xss_patterns": request_data.get("xss_attack_count", 0),
-                "directory_traversal_attempts": request_data.get("directory_traversal_count", 0),
-                "command_injection_count": request_data.get("command_injection_count", 0),
-                "csrf_count": request_data.get("csrf_count", 0)
+                "path_entropy": float(request_data.get("path_entropy", 0)),
+                "body_entropy": float(request_data.get("body_entropy", 0)),
+                "url_length": int(request_data.get("url_length", 0)),
+                "body_length": int(request_data.get("body_length", 0)),
+                "single_quotes_count": int(request_data.get("single_q", 0)),
+                "double_quotes_count": int(request_data.get("double_q", 0)),
+                "dashes_count": int(request_data.get("dashes", 0)),
+                "braces_count": int(request_data.get("braces", 0)),
+                "spaces_count": int(request_data.get("spaces", 0)),
+                "sql_injection_patterns": int(request_data.get("sql_injection_count", 0)),
+                "xss_patterns": int(request_data.get("xss_attack_count", 0)),
+                "directory_traversal_attempts": int(request_data.get("directory_traversal_count", 0)),
+                "command_injection_count": int(request_data.get("command_injection_count", 0)),
+                "csrf_count": int(request_data.get("csrf_count", 0))
             },
             "ml_attack_detection": {
                 "attack_class": attack_class,
-                "ml_confidence_score": float(ml_max_prob),
+                "ml_confidence_score": ml_max_prob,
                 "anomaly_score": float(anomaly_score),
-                "feature_contributions": feature_contributions
+                "feature_contributions": anomaly_features_dict
             },
             "log_performance_insights": {
                 "total_requests_handled": total_requests,
@@ -369,10 +364,10 @@ def detect_attack(request_data):
             "anomaly_detected": int(is_anomaly),
             "attack_detected": int(is_attack),
             "ddos_detected": int(is_ddos),
-            "response_time": response_time,
+            "response_time": float(response_time),  # Convert to float
             "anomaly_score": float(anomaly_score),
-            "ml_max_prob": float(ml_max_prob),
-            "ddos_prob": float(ddos_prediction)
+            "ml_max_prob": ml_max_prob,
+            "ddos_prob": ddos_prediction
         }
 
         print(f"[DEBUG] 🔍 Detection Result: {result}")
@@ -380,7 +375,7 @@ def detect_attack(request_data):
 
         if (is_anomaly and is_attack) or is_ddos:
             print("[DEBUG] 🚨 Request blocked due to anomaly, attack, or DDoS detection.")
-            logging.info('{"event": "request_blocked", "reason": "anomaly" if is_anomaly else "attack" if is_attack else "ddos"}')
+            logging.info('{"event": "request_blocked", "reason": "anomaly_and_attack" if is_anomaly and is_attack else "ddos"}')
             return jsonify({"error": "Blocked", "status": "Blocked"}), 403
         else:
             print("[DEBUG] ✅ Request allowed.")
@@ -393,7 +388,6 @@ def detect_attack(request_data):
         return jsonify({"error": f"Internal processing error: {str(e)}"}), 500
 
 def save_to_json_dashboard(log_entry):
-    """Save a log entry to a JSON file for dashboard use."""
     try:
         try:
             with open(DASHBOARD_LOG_FILE, 'r') as f:
@@ -411,7 +405,6 @@ def save_to_json_dashboard(log_entry):
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
-    """Analyze incoming requests."""
     try:
         request_data = request.json
         print("\n[DEBUG] 📥 Incoming Request Data to WAF:")
