@@ -1,0 +1,35 @@
+[
+    {
+      "type": "ip-block",
+      "ip": "192.91.19.1",
+      "id": 1
+    },
+    {
+      "type": "rate-limit",
+      "requestsPerSecond": 200,
+      "id": 2
+    },
+    {
+      "type": "geo-block",
+      "country": "CN",
+      "reason": "High risk of attacks",
+      "id": 3
+    },
+    {
+      "type": "http-method",
+      "method": "",
+      "action": "block",
+      "id": 4
+    },
+    {
+      "type": "port-block",
+      "port": 8080,
+      "id": 5
+    },
+    {
+      "type": "domain-block",
+      "domain": "malicious.com",
+      "reason": "Known malicious domain",
+      "id": 6
+    }
+  ]
